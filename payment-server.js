@@ -1,5 +1,7 @@
 // Square Payment Integration Backend
-// This Node.js/Express server handles Square payments and sends bolt.new templates
+// This Node.js/Express server handles Square payments and, once paid, posts the
+// order to the site engine's deploy API so the contractor's site is built and
+// published automatically.
 
 const express = require('express');
 const cors = require('cors');
@@ -44,8 +46,20 @@ app.post('/api/create-square-checkout', async (req, res) => {
             tradeType,
             serviceArea,
             packageType,
-            amount
+            amount,
+            rocNumber,
+            licenseClass,
+            zip
         } = req.body;
+
+        // Without an ROC number we cannot build a site that satisfies
+        // A.R.S. 32-1124(B)(4), so do not take the money for one.
+        if (!rocNumber || !String(rocNumber).replace(/[^0-9]/g, '')) {
+            return res.status(400).json({
+                success: false,
+                error: 'An Arizona ROC license number is required. Arizona law requires it to be displayed on the site.'
+            });
+        }
 
         // Create unique order ID
         const orderId = `ACW-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -87,7 +101,10 @@ app.post('/api/create-square-checkout', async (req, res) => {
                     phone: phone,
                     tradeType: tradeType,
                     serviceArea: serviceArea,
-                    packageType: packageType
+                    packageType: packageType,
+                    rocNumber: String(rocNumber).replace(/[^0-9]/g, ''),
+                    licenseClass: licenseClass || '',
+                    zip: zip || ''
                 }
             },
             checkoutOptions: {
@@ -111,6 +128,9 @@ app.post('/api/create-square-checkout', async (req, res) => {
             serviceArea,
             packageType,
             amount,
+            rocNumber: String(rocNumber).replace(/[^0-9]/g, ''),
+            licenseClass: licenseClass || '',
+            zip: zip || '',
             status: 'pending',
             createdAt: new Date().toISOString()
         });
@@ -152,7 +172,10 @@ app.post('/api/square-webhook', async (req, res) => {
                     phone: orderMetadata.phone,
                     tradeType: orderMetadata.tradeType,
                     serviceArea: orderMetadata.serviceArea,
-                    packageType: orderMetadata.packageType
+                    packageType: orderMetadata.packageType,
+                    rocNumber: orderMetadata.rocNumber,
+                    licenseClass: orderMetadata.licenseClass,
+                    zip: orderMetadata.zip
                 };
 
                 // Update order status
@@ -163,8 +186,17 @@ app.post('/api/square-webhook', async (req, res) => {
                     order.squarePaymentId = payment.id;
                 }
 
-                // Generate and send bolt.new template
-                await sendBoltTemplate(orderDetails);
+                // Build and publish the site, then send the customer its URL.
+                const published = await fulfilOrder(orderDetails);
+                if (orders.has(orderDetails.orderId)) {
+                    Object.assign(orders.get(orderDetails.orderId), {
+                        siteUrl: published.url || null,
+                        siteId: published.siteId || null,
+                        fulfilledAt: new Date().toISOString(),
+                        fulfilmentError: published.error || null
+                    });
+                }
+                await sendSiteEmail(orderDetails, published);
 
                 // Send confirmation email to admin
                 await sendAdminNotification(orderDetails);
@@ -179,91 +211,133 @@ app.post('/api/square-webhook', async (req, res) => {
     }
 });
 
-// Generate bolt.new template based on trade type
-function generateBoltTemplate(orderDetails) {
-    const { businessName, tradeType, serviceArea, packageType } = orderDetails;
+// ---------------------------------------------------------------------------
+// Fulfilment
+//
+// This used to generate a bolt.new PROMPT, email it to the customer, and leave
+// a human to paste it in and build the site by hand. The trade colour table
+// and the per-trade service lists it carried were a third copy of data that
+// also lived in builder.html and in the contractor-website-generator skill,
+// and the three had already drifted apart.
+//
+// Now a paid order posts a ClientSpec to the site engine's deploy API, which
+// builds the whole multi-page site, runs the Arizona ROC and quality checks,
+// and publishes it. The customer gets a URL instead of a prompt.
+//
+// Env: ACP_DEPLOY_API (e.g. https://acp-api.netlify.app/api/deploy)
+//      ACP_BUILDER_KEY (the same shared secret the engine expects)
+// ---------------------------------------------------------------------------
 
-    // Base template structure
-    let template = `Create a professional contractor website for ${businessName}, a ${tradeType} contractor serving ${serviceArea}.
+/** Turn a paid order into the engine's ClientSpec shape. */
+function orderToSpec(orderDetails) {
+    const cities = String(orderDetails.serviceArea || '')
+        .split(',').map(c => c.trim()).filter(Boolean);
 
-Requirements:
-1. Modern, mobile-responsive design
-2. Professional hero section with business name and strong call-to-action
-3. Services section highlighting key ${tradeType} services
-4. About section emphasizing experience and quality
-5. Photo gallery section (placeholder images for now)
-6. Contact section with form, phone, and email
-7. Google Maps integration
-8. Testimonials section
-9. Arizona contractor license information section
-10. Footer with business information
-
-Design style:
-- Clean, professional layout
-- Use construction/contractor-appropriate color scheme
-- Bold, easy-to-read typography
-- High-contrast call-to-action buttons
-- Trust indicators (years of experience, licensed, insured)
-
-Colors suggestion based on trade:
-${getTradeColors(tradeType)}
-
-Key sections to include:
-${getTradeServices(tradeType)}
-
-Call-to-action buttons:
-- "Get Free Estimate"
-- "Call Now: [PHONE]"
-- "Request Quote"
-- "View Our Work"
-
-Make it conversion-focused with multiple contact points throughout the page.`;
-
-    return template;
-}
-
-// Get color scheme based on trade type
-function getTradeColors(tradeType) {
-    const colorSchemes = {
-        masonry: '- Primary: #d84315 (brick red)\n- Secondary: #5d4037 (brown)\n- Accent: #ff6f00 (orange)',
-        plumbing: '- Primary: #1976d2 (blue)\n- Secondary: #0277bd (dark blue)\n- Accent: #00acc1 (cyan)',
-        electrical: '- Primary: #ffd600 (yellow)\n- Secondary: #212121 (dark gray)\n- Accent: #ff6f00 (orange)',
-        hvac: '- Primary: #1976d2 (cool blue)\n- Secondary: #d32f2f (warm red)\n- Accent: #43a047 (green)',
-        roofing: '- Primary: #424242 (charcoal)\n- Secondary: #d32f2f (red)\n- Accent: #757575 (gray)',
-        landscaping: '- Primary: #2e7d32 (green)\n- Secondary: #795548 (brown)\n- Accent: #8bc34a (light green)',
-        painting: '- Primary: #7b1fa2 (purple)\n- Secondary: #f57c00 (orange)\n- Accent: #0288d1 (blue)',
-        carpentry: '- Primary: #5d4037 (wood brown)\n- Secondary: #ff6f00 (orange)\n- Accent: #424242 (charcoal)',
-        flooring: '- Primary: #6d4c41 (wood)\n- Secondary: #455a64 (slate)\n- Accent: #ff6f00 (orange)',
-        general: '- Primary: #1976d2 (professional blue)\n- Secondary: #f57c00 (construction orange)\n- Accent: #424242 (charcoal)'
+    return {
+        business: {
+            name: orderDetails.businessName,
+            owner: orderDetails.contactName,
+            trade: orderDetails.tradeType,
+            targetCustomer: 'both',
+            tagline: 'auto'
+        },
+        license: {
+            rocNumber: orderDetails.rocNumber,
+            class: orderDetails.licenseClass || '',
+            status: 'Active',
+            bonded: true,
+            insured: true
+        },
+        contact: {
+            phone: orderDetails.phone,
+            email: orderDetails.email,
+            address: { city: cities[0] || 'Phoenix', state: 'AZ', zip: orderDetails.zip || '' }
+        },
+        serviceArea: { cities },
+        // Services are left empty on purpose: the engine fills in the standard
+        // set for the trade, which is a better starting point than anything we
+        // could infer from an order form. They get edited before launch.
+        services: [],
+        proof: { reviews: [], gallery: [] },
+        offers: { freeEstimates: true },
+        integrations: {
+            // Without this the generated form shows its success message and
+            // stores nothing, which is the most expensive thing to get wrong:
+            // the site looks finished and silently drops every enquiry.
+            leadEndpoint: process.env.ACP_LEAD_ENDPOINT || '',
+            notificationEmail: process.env.ADMIN_EMAIL || orderDetails.email
+        },
+        site: {
+            pages: { servicePages: true, areaPages: true, gallery: false, reviews: true, faq: true, about: true, contact: true },
+            theme: { primary: 'auto', accent: 'auto' }
+        }
     };
-
-    return colorSchemes[tradeType] || colorSchemes.general;
 }
 
-// Get services based on trade type
-function getTradeServices(tradeType) {
-    const services = {
-        masonry: '- Block wall construction and repair\n- Stucco installation and repair\n- Stone veneer and natural stone work\n- Brick work and restoration\n- Retaining walls\n- Outdoor living spaces',
-        plumbing: '- Residential plumbing repairs\n- Water heater installation\n- Leak detection and repair\n- Drain cleaning\n- Fixture installation\n- Emergency plumbing services',
-        electrical: '- Electrical repairs and troubleshooting\n- Panel upgrades\n- Lighting installation\n- Outlet and switch installation\n- Ceiling fan installation\n- Safety inspections',
-        hvac: '- AC installation and replacement\n- Heating system repair\n- Preventive maintenance\n- Emergency HVAC services\n- Duct cleaning\n- Thermostat installation',
-        roofing: '- Roof replacement\n- Roof repairs\n- Shingle installation\n- Tile roofing\n- Flat roof systems\n- Storm damage repair',
-        landscaping: '- Landscape design\n- Irrigation installation\n- Tree and shrub planting\n- Hardscaping\n- Lawn maintenance\n- Outdoor lighting',
-        painting: '- Interior painting\n- Exterior painting\n- Cabinet refinishing\n- Drywall repair\n- Staining and sealing\n- Commercial painting',
-        carpentry: '- Custom cabinetry\n- Deck construction\n- Door and window installation\n- Trim work\n- Framing\n- Custom woodwork',
-        flooring: '- Hardwood floor installation\n- Tile installation\n- Laminate flooring\n- Vinyl plank\n- Floor refinishing\n- Carpet installation',
-        general: '- Residential remodeling\n- Kitchen and bath renovation\n- Room additions\n- Home repairs\n- New construction\n- Project management'
-    };
+/** Build and publish. Never throws: a failure here must not lose the order. */
+async function fulfilOrder(orderDetails) {
+    const api = process.env.ACP_DEPLOY_API;
+    const key = process.env.ACP_BUILDER_KEY;
 
-    return services[tradeType] || services.general;
+    if (!api || !key) {
+        const error = 'ACP_DEPLOY_API or ACP_BUILDER_KEY is not configured, so the site was not built.';
+        console.error('Fulfilment skipped:', error);
+        return { error };
+    }
+
+    try {
+        const res = await fetch(api, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-builder-key': key },
+            body: JSON.stringify({ spec: orderToSpec(orderDetails) })
+        });
+        const out = await res.json().catch(() => ({ error: 'The deploy API returned a non-JSON response.' }));
+        if (!res.ok) {
+            console.error('Deploy API error:', out);
+            return { error: out.error || `Deploy API returned ${res.status}`, checks: out.checks };
+        }
+        console.log(`Published ${orderDetails.businessName}: ${out.url}`);
+        return out;
+    } catch (err) {
+        console.error('Fulfilment failed:', err);
+        return { error: err.message };
+    }
 }
 
-// Send bolt.new template email
-async function sendBoltTemplate(orderDetails) {
-    const template = generateBoltTemplate(orderDetails);
-    
-    const emailHtml = `
-<!DOCTYPE html>
+/** Email the customer their live site, or tell them we are on it. */
+async function sendSiteEmail(orderDetails, published) {
+    const packageName = orderDetails.packageType === 'website' ? 'Professional Website'
+        : orderDetails.packageType === 'social' ? 'Social Media Setup'
+        : 'Complete Package';
+
+    const built = !published.error && published.url;
+
+    const body = built ? `
+            <h2>Your site is live, ${esc(orderDetails.contactName)}.</h2>
+            <p>We built it from the details on your order. Have a look, then tell us what to change.</p>
+            <p style="margin:28px 0"><a class="button" href="${esc(published.url)}">${esc(published.url)}</a></p>
+            <p>It has ${published.manifest ? published.manifest.pageCount : 'a'} pages: a home page, one for each
+            service, one for each city you serve, plus about, reviews, FAQ and contact. Your ROC number
+            ${esc(orderDetails.rocNumber)} is in the header of every page, linked to the Registrar's lookup,
+            which is what Arizona law asks for.</p>
+
+            <h3>What we need from you</h3>
+            <ul>
+              <li><strong>Job photos.</strong> Six to ten of your own work. Real photos beat stock every time,
+                  and right now the site has none rather than something generic.</li>
+              <li><strong>Your service list.</strong> We started with the standard set for ${esc(orderDetails.tradeType)}.
+                  Tell us what to add, cut or rename.</li>
+              <li><strong>Reviews.</strong> We do not write these. Send us real ones, or we will set up a
+                  review link you can text to customers.</li>
+              <li><strong>Your domain</strong>, if you have one.</li>
+            </ul>
+    ` : `
+            <h2>Thanks, ${esc(orderDetails.contactName)}. We have your order.</h2>
+            <p>Your payment went through and we are building your site now. You will get the link shortly.</p>
+            <p style="color:#757575;font-size:13px">If you need anything in the meantime, just reply to this email.</p>
+    `;
+
+    const emailHtml = `<!DOCTYPE html>
 <html>
 <head>
     <style>
@@ -271,79 +345,49 @@ async function sendBoltTemplate(orderDetails) {
         .container { max-width: 600px; margin: 0 auto; padding: 20px; }
         .header { background: #d84315; color: white; padding: 20px; text-align: center; }
         .content { background: #f5f5f5; padding: 30px; }
-        .template-box { background: white; padding: 20px; border-left: 4px solid #1976d2; margin: 20px 0; }
-        .button { display: inline-block; background: #1976d2; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; margin: 10px 0; }
+        .button { display: inline-block; background: #1976d2; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; }
         .footer { text-align: center; padding: 20px; color: #757575; font-size: 14px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="header">
-            <h1>Welcome to AZ Contractor Pro!</h1>
-        </div>
+        <div class="header"><h1>AZ Contractor Pro</h1></div>
         <div class="content">
-            <h2>Thank You for Your Order, ${orderDetails.contactName}!</h2>
-            <p>We've received your payment and are excited to build your professional contractor website.</p>
-            
-            <h3>Order Details:</h3>
+            ${body}
+            <h3>Your order</h3>
             <ul>
-                <li><strong>Business:</strong> ${orderDetails.businessName}</li>
-                <li><strong>Package:</strong> ${orderDetails.packageType === 'website' ? 'Professional Website' : orderDetails.packageType === 'social' ? 'Social Media Setup' : 'Complete Package'}</li>
-                <li><strong>Trade:</strong> ${orderDetails.tradeType}</li>
-                <li><strong>Service Area:</strong> ${orderDetails.serviceArea}</li>
+                <li><strong>Business:</strong> ${esc(orderDetails.businessName)}</li>
+                <li><strong>Package:</strong> ${esc(packageName)}</li>
+                <li><strong>Trade:</strong> ${esc(orderDetails.tradeType)}</li>
+                <li><strong>Service area:</strong> ${esc(orderDetails.serviceArea)}</li>
+                <li><strong>ROC:</strong> #${esc(orderDetails.rocNumber)}</li>
+                <li><strong>Order:</strong> ${esc(orderDetails.orderId)}</li>
             </ul>
-
-            <h3>🚀 Your Website Template</h3>
-            <p>Below is your custom bolt.new template. You can use this to preview and customize your website:</p>
-            
-            <div class="template-box">
-                <pre style="white-space: pre-wrap; font-size: 13px;">${template}</pre>
-            </div>
-
-            <a href="https://bolt.new" class="button" target="_blank">Open bolt.new</a>
-
-            <h3>Next Steps:</h3>
-            <ol>
-                <li><strong>Copy the template above</strong> - This is your custom website prompt</li>
-                <li><strong>Visit bolt.new</strong> - Click the button above to open bolt.new</li>
-                <li><strong>Paste the template</strong> - Paste your template into bolt.new</li>
-                <li><strong>We'll customize it</strong> - Our team will finalize your website within 3-5 business days</li>
-                <li><strong>Go live!</strong> - We'll deploy your website and send you the final link</li>
-            </ol>
-
-            <h3>What Happens Next?</h3>
-            <p>Our team is already working on your website. We'll reach out within 24 hours to:</p>
-            <ul>
-                <li>Gather any additional information we need</li>
-                <li>Collect your photos and logo (if available)</li>
-                <li>Confirm your contact information and service details</li>
-                <li>Set up your domain (if needed)</li>
-            </ul>
-
-            <p><strong>Timeline:</strong> Your website will be completed and live within 3-5 business days.</p>
-
-            <p>If you have any questions, reply to this email or call us.</p>
-
-            <p>Thank you for choosing AZ Contractor Pro!</p>
         </div>
         <div class="footer">
-            <p>AZ Contractor Pro<br>
-            Professional Websites for Arizona Contractors<br>
-            info@azcontractorpro.com</p>
+            <p>AZ Contractor Pro &middot; <a href="mailto:${esc(process.env.SMTP_FROM || 'info@azcontractorpro.com')}">${esc(process.env.SMTP_FROM || 'info@azcontractorpro.com')}</a></p>
         </div>
     </div>
 </body>
-</html>
-    `;
+</html>`;
 
-    await transporter.sendMail({
-        from: process.env.SMTP_FROM || 'info@azcontractorpro.com',
-        to: orderDetails.email,
-        subject: `Your ${orderDetails.businessName} Website Template - AZ Contractor Pro`,
-        html: emailHtml
-    });
+    try {
+        await transporter.sendMail({
+            from: process.env.SMTP_FROM || 'info@azcontractorpro.com',
+            to: orderDetails.email,
+            subject: built ? `Your site is live: ${orderDetails.businessName}` : `We have your order, ${orderDetails.contactName}`,
+            html: emailHtml
+        });
+    } catch (err) {
+        console.error('Could not send the customer email:', err);
+    }
+}
 
-    console.log(`Bolt.new template sent to ${orderDetails.email}`);
+/** Minimal escaping so a business name cannot inject markup into the email. */
+function esc(v) {
+    return String(v == null ? '' : v)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 // Send admin notification
@@ -476,14 +520,14 @@ app.get('/payment-success', (req, res) => {
         <div class="next-steps">
             <h3>What Happens Next?</h3>
             <ol>
-                <li><strong>Check your email</strong> - You'll receive your custom bolt.new template within minutes</li>
-                <li><strong>We'll contact you</strong> - Our team will reach out within 24 hours</li>
-                <li><strong>Website development</strong> - We'll build your site in 3-5 business days</li>
-                <li><strong>Go live!</strong> - Your website will be deployed and ready to get customers</li>
+                <li><strong>Your site gets built</strong> - automatically, within a few minutes</li>
+                <li><strong>Check your email</strong> - we send you the live link as soon as it is up</li>
+                <li><strong>Send us your job photos</strong> - real photos of your work, and your service list if you want it changed</li>
+                <li><strong>We point it at your domain</strong> - and you are live</li>
             </ol>
         </div>
         <p><strong>Important:</strong> Save your Order ID for reference.</p>
-        <p>If you don't receive your email within 10 minutes, please check your spam folder or contact us.</p>
+        <p>If you don't receive your email within 15 minutes, please check your spam folder or contact us.</p>
         <a href="/" class="button">Return to Homepage</a>
     </div>
 </body>

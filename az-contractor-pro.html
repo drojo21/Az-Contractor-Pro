@@ -719,7 +719,30 @@
 
                     <div class="form-group">
                         <label for="serviceArea">Service Area (City/Cities) *</label>
-                        <input type="text" id="serviceArea" name="serviceArea" placeholder="e.g., Tucson, Phoenix, Mesa" required>
+                        <input type="text" id="serviceArea" name="serviceArea" placeholder="e.g., Tucson, Marana, Oro Valley" required>
+                        <small style="display:block;margin-top:.35rem;color:#757575;">List the main city first. Every other city gets its own page.</small>
+                    </div>
+
+                    <!--
+                      The ROC number is not optional paperwork. A.R.S. 32-1124(B)(4)
+                      only lets a contractor advertise a URL in place of the licence
+                      number when the site shows the name and number prominently on
+                      the home page, so we cannot build a compliant site without it.
+                    -->
+                    <div class="form-group">
+                        <label for="rocNumber">Arizona ROC License Number *</label>
+                        <input type="text" id="rocNumber" name="rocNumber" inputmode="numeric" placeholder="e.g., 337881" required>
+                        <small style="display:block;margin-top:.35rem;color:#757575;">Required by Arizona law to appear on your site. We display it in the header and link it to the ROC lookup.</small>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="licenseClass">License Class</label>
+                        <input type="text" id="licenseClass" name="licenseClass" placeholder="e.g., KB-2, CR-39, CR-11">
+                    </div>
+
+                    <div class="form-group">
+                        <label for="zip">Business ZIP Code</label>
+                        <input type="text" id="zip" name="zip" inputmode="numeric" maxlength="5" placeholder="e.g., 85706">
                     </div>
 
                     <div class="form-group">
@@ -845,35 +868,21 @@
             document.getElementById('loadingSpinner').style.display = 'block';
             
             try {
-                // TODO: Replace with your actual Square payment endpoint
-                // This is where you'll integrate with Square Checkout API
-                
-                // For now, this is a placeholder that shows the integration point
-                alert(`Order Details:\n\nBusiness: ${data.businessName}\nContact: ${data.contactName}\nEmail: ${data.email}\nPhone: ${data.phone}\nTrade: ${data.tradeType}\nArea: ${data.serviceArea}\nPackage: ${data.packageType}\nAmount: $${data.amount}\n\nNext Step: Integrate Square Checkout API\n\nAfter payment:\n1. Create Square checkout session\n2. Redirect to Square payment page\n3. Process payment\n4. Send confirmation email with bolt.new template\n5. Store order in database`);
-                
-                // Example Square Checkout API integration:
-                /*
                 const response = await fetch('/api/create-square-checkout', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(data)
                 });
-                
+
                 const result = await response.json();
-                
-                if (result.checkoutUrl) {
-                    // Redirect to Square checkout page
-                    window.location.href = result.checkoutUrl;
-                } else {
-                    throw new Error('Failed to create checkout session');
-                }
-                */
-                
+                if (!response.ok) throw new Error(result.error || 'Could not start checkout.');
+                if (!result.checkoutUrl) throw new Error('Checkout session came back without a payment link.');
+
+                window.location.href = result.checkoutUrl;
+
             } catch (error) {
                 console.error('Error:', error);
-                alert('There was an error processing your order. Please try again or contact support.');
+                alert(error.message || 'There was an error processing your order. Please try again or contact support.');
             } finally {
                 submitButton.disabled = false;
                 submitButton.textContent = 'Complete Payment with Square';
