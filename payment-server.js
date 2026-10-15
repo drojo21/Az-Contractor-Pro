@@ -1,190 +1,91 @@
-// Square Payment Integration Backend
-// This Node.js/Express server handles Square payments and sends bolt.new templates
+// Stripe Checkout backend for AZ Contractor Pro
+// Creates the checkout for the order form, fulfills paid orders from Stripe webhooks
+// (bolt.new template email + admin notification) and reports every order to the CRM.
 
+'use strict';
+
+const path = require('node:path');
+const crypto = require('node:crypto');
 const express = require('express');
 const cors = require('cors');
-const { Client, Environment } = require('square');
+const Stripe = require('stripe');
 const nodemailer = require('nodemailer');
 require('dotenv').config();
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+// Prices live here, never in the browser: the order form only sends which package.
+const PACKAGES = {
+    website: { name: 'Professional Website', price: 250 },
+    social: { name: 'Social Media Setup', price: 120 },
+    complete: { name: 'Complete Package (Website + Social Media)', price: 370 }
+};
 
-// Initialize Square client
-const squareClient = new Client({
-    accessToken: process.env.SQUARE_ACCESS_TOKEN,
-    environment: process.env.SQUARE_ENVIRONMENT === 'production' 
-        ? Environment.Production 
-        : Environment.Sandbox
-});
+const TRADES = ['masonry', 'plumbing', 'electrical', 'hvac', 'roofing', 'landscaping',
+    'painting', 'carpentry', 'flooring', 'general', 'other'];
 
-// Email transporter (configure with your email service)
-const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST || 'smtp.gmail.com',
-    port: process.env.SMTP_PORT || 587,
-    secure: false,
-    auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS
+const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+function configFromEnv(env = process.env) {
+    const port = parseInt(env.PORT, 10) || 3000;
+    return {
+        port,
+        baseUrl: (env.BASE_URL || `http://localhost:${port}`).replace(/\/+$/, ''),
+        stripeSecretKey: env.STRIPE_SECRET_KEY || '',
+        stripeWebhookSecret: env.STRIPE_WEBHOOK_SECRET || '',
+        allowedOrigins: (env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean),
+        smtp: {
+            host: env.SMTP_HOST || 'smtp.gmail.com',
+            port: parseInt(env.SMTP_PORT, 10) || 587,
+            user: env.SMTP_USER || '',
+            pass: env.SMTP_PASS || ''
+        },
+        smtpFrom: env.SMTP_FROM || 'info@azcontractorpro.com',
+        adminEmail: env.ADMIN_EMAIL || 'admin@azcontractorpro.com',
+        crmUrl: (env.CRM_URL || '').replace(/\/+$/, ''),
+        crmKey: env.CRM_KEY || ''
+    };
+}
+
+// ---------------------------------------------------------------- order validation
+
+const FIELD_LIMITS = { businessName: 120, contactName: 80, email: 254, phone: 30, tradeType: 20, serviceArea: 200 };
+
+/** Returns { order } or { error }. Values are trimmed and capped (Stripe metadata allows 500 chars). */
+function validateOrder(body = {}) {
+    const order = {};
+    for (const [field, max] of Object.entries(FIELD_LIMITS)) {
+        order[field] = String(body[field] ?? '').trim().slice(0, max);
+        if (!order[field]) return { error: `${field} is required` };
     }
-});
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(order.email)) return { error: 'Please enter a valid email address' };
+    if (!TRADES.includes(order.tradeType)) return { error: 'Please choose your trade' };
+    order.packageType = String(body.packageType || '');
+    if (!PACKAGES[order.packageType]) return { error: 'Please choose a package' };
+    return { order };
+}
 
-// Store orders temporarily (in production, use a database)
-const orders = new Map();
+function orderFromSession(session) {
+    const m = session.metadata || {};
+    return {
+        orderId: m.orderId || session.client_reference_id,
+        businessName: m.businessName,
+        contactName: m.contactName,
+        email: m.email || session.customer_details?.email || session.customer_email,
+        phone: m.phone,
+        tradeType: m.tradeType,
+        serviceArea: m.serviceArea,
+        packageType: m.packageType,
+        amount: (session.amount_total ?? 0) / 100
+    };
+}
 
-// Create Square Checkout
-app.post('/api/create-square-checkout', async (req, res) => {
-    try {
-        const {
-            businessName,
-            contactName,
-            email,
-            phone,
-            tradeType,
-            serviceArea,
-            packageType,
-            amount
-        } = req.body;
-
-        // Create unique order ID
-        const orderId = `ACW-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-
-        // Determine package name
-        let packageName = '';
-        switch(packageType) {
-            case 'website':
-                packageName = 'Professional Website';
-                break;
-            case 'social':
-                packageName = 'Social Media Setup';
-                break;
-            case 'complete':
-                packageName = 'Complete Package (Website + Social Media)';
-                break;
-        }
-
-        // Create Square checkout
-        const checkoutResponse = await squareClient.checkoutApi.createPaymentLink({
-            idempotencyKey: orderId,
-            order: {
-                locationId: process.env.SQUARE_LOCATION_ID,
-                lineItems: [
-                    {
-                        name: packageName,
-                        quantity: '1',
-                        basePriceMoney: {
-                            amount: BigInt(amount * 100), // Amount in cents
-                            currency: 'USD'
-                        }
-                    }
-                ],
-                metadata: {
-                    orderId: orderId,
-                    businessName: businessName,
-                    contactName: contactName,
-                    email: email,
-                    phone: phone,
-                    tradeType: tradeType,
-                    serviceArea: serviceArea,
-                    packageType: packageType
-                }
-            },
-            checkoutOptions: {
-                redirectUrl: `${process.env.BASE_URL}/payment-success?orderId=${orderId}`,
-                askForShippingAddress: false
-            },
-            prePopulatedData: {
-                buyerEmail: email,
-                buyerPhoneNumber: phone
-            }
-        });
-
-        // Store order details
-        orders.set(orderId, {
-            orderId,
-            businessName,
-            contactName,
-            email,
-            phone,
-            tradeType,
-            serviceArea,
-            packageType,
-            amount,
-            status: 'pending',
-            createdAt: new Date().toISOString()
-        });
-
-        res.json({
-            success: true,
-            checkoutUrl: checkoutResponse.result.paymentLink.url,
-            orderId: orderId
-        });
-
-    } catch (error) {
-        console.error('Square checkout error:', error);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to create checkout session',
-            details: error.message
-        });
-    }
-});
-
-// Square Webhook - Payment completed
-app.post('/api/square-webhook', async (req, res) => {
-    try {
-        const { type, data } = req.body;
-
-        // Handle payment completed event
-        if (type === 'payment.created' || type === 'payment.updated') {
-            const payment = data.object.payment;
-            const orderId = payment.orderId;
-            const orderMetadata = payment.order?.metadata;
-
-            if (payment.status === 'COMPLETED' && orderMetadata) {
-                // Get order details from metadata
-                const orderDetails = {
-                    orderId: orderMetadata.orderId,
-                    businessName: orderMetadata.businessName,
-                    contactName: orderMetadata.contactName,
-                    email: orderMetadata.email,
-                    phone: orderMetadata.phone,
-                    tradeType: orderMetadata.tradeType,
-                    serviceArea: orderMetadata.serviceArea,
-                    packageType: orderMetadata.packageType
-                };
-
-                // Update order status
-                if (orders.has(orderDetails.orderId)) {
-                    const order = orders.get(orderDetails.orderId);
-                    order.status = 'paid';
-                    order.paidAt = new Date().toISOString();
-                    order.squarePaymentId = payment.id;
-                }
-
-                // Generate and send bolt.new template
-                await sendBoltTemplate(orderDetails);
-
-                // Send confirmation email to admin
-                await sendAdminNotification(orderDetails);
-            }
-        }
-
-        res.json({ success: true });
-
-    } catch (error) {
-        console.error('Webhook error:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
+// ---------------------------------------------------------------- bolt.new template
 
 // Generate bolt.new template based on trade type
 function generateBoltTemplate(orderDetails) {
-    const { businessName, tradeType, serviceArea, packageType } = orderDetails;
+    const { businessName, tradeType, serviceArea } = orderDetails;
 
-    // Base template structure
-    let template = `Create a professional contractor website for ${businessName}, a ${tradeType} contractor serving ${serviceArea}.
+    return `Create a professional contractor website for ${businessName}, a ${tradeType} contractor serving ${serviceArea}.
 
 Requirements:
 1. Modern, mobile-responsive design
@@ -218,8 +119,6 @@ Call-to-action buttons:
 - "View Our Work"
 
 Make it conversion-focused with multiple contact points throughout the page.`;
-
-    return template;
 }
 
 // Get color scheme based on trade type
@@ -258,11 +157,11 @@ function getTradeServices(tradeType) {
     return services[tradeType] || services.general;
 }
 
-// Send bolt.new template email
-async function sendBoltTemplate(orderDetails) {
+// ---------------------------------------------------------------- emails
+
+function customerEmailHtml(orderDetails) {
     const template = generateBoltTemplate(orderDetails);
-    
-    const emailHtml = `
+    return `
 <!DOCTYPE html>
 <html>
 <head>
@@ -282,22 +181,23 @@ async function sendBoltTemplate(orderDetails) {
             <h1>Welcome to AZ Contractor Pro!</h1>
         </div>
         <div class="content">
-            <h2>Thank You for Your Order, ${orderDetails.contactName}!</h2>
+            <h2>Thank You for Your Order, ${esc(orderDetails.contactName)}!</h2>
             <p>We've received your payment and are excited to build your professional contractor website.</p>
-            
+
             <h3>Order Details:</h3>
             <ul>
-                <li><strong>Business:</strong> ${orderDetails.businessName}</li>
-                <li><strong>Package:</strong> ${orderDetails.packageType === 'website' ? 'Professional Website' : orderDetails.packageType === 'social' ? 'Social Media Setup' : 'Complete Package'}</li>
-                <li><strong>Trade:</strong> ${orderDetails.tradeType}</li>
-                <li><strong>Service Area:</strong> ${orderDetails.serviceArea}</li>
+                <li><strong>Order ID:</strong> ${esc(orderDetails.orderId)}</li>
+                <li><strong>Business:</strong> ${esc(orderDetails.businessName)}</li>
+                <li><strong>Package:</strong> ${esc(PACKAGES[orderDetails.packageType]?.name || orderDetails.packageType)}</li>
+                <li><strong>Trade:</strong> ${esc(orderDetails.tradeType)}</li>
+                <li><strong>Service Area:</strong> ${esc(orderDetails.serviceArea)}</li>
             </ul>
 
             <h3>🚀 Your Website Template</h3>
             <p>Below is your custom bolt.new template. You can use this to preview and customize your website:</p>
-            
+
             <div class="template-box">
-                <pre style="white-space: pre-wrap; font-size: 13px;">${template}</pre>
+                <pre style="white-space: pre-wrap; font-size: 13px;">${esc(template)}</pre>
             </div>
 
             <a href="https://bolt.new" class="button" target="_blank">Open bolt.new</a>
@@ -335,20 +235,10 @@ async function sendBoltTemplate(orderDetails) {
 </body>
 </html>
     `;
-
-    await transporter.sendMail({
-        from: process.env.SMTP_FROM || 'info@azcontractorpro.com',
-        to: orderDetails.email,
-        subject: `Your ${orderDetails.businessName} Website Template - AZ Contractor Pro`,
-        html: emailHtml
-    });
-
-    console.log(`Bolt.new template sent to ${orderDetails.email}`);
 }
 
-// Send admin notification
-async function sendAdminNotification(orderDetails) {
-    const emailHtml = `
+function adminEmailHtml(orderDetails) {
+    return `
 <!DOCTYPE html>
 <html>
 <head>
@@ -368,14 +258,14 @@ async function sendAdminNotification(orderDetails) {
         <div class="content">
             <h2>Order Details</h2>
             <div class="info-box">
-                <p><strong>Order ID:</strong> ${orderDetails.orderId}</p>
-                <p><strong>Business Name:</strong> ${orderDetails.businessName}</p>
-                <p><strong>Contact Name:</strong> ${orderDetails.contactName}</p>
-                <p><strong>Email:</strong> ${orderDetails.email}</p>
-                <p><strong>Phone:</strong> ${orderDetails.phone}</p>
-                <p><strong>Trade Type:</strong> ${orderDetails.tradeType}</p>
-                <p><strong>Service Area:</strong> ${orderDetails.serviceArea}</p>
-                <p><strong>Package:</strong> ${orderDetails.packageType}</p>
+                <p><strong>Order ID:</strong> ${esc(orderDetails.orderId)}</p>
+                <p><strong>Business Name:</strong> ${esc(orderDetails.businessName)}</p>
+                <p><strong>Contact Name:</strong> ${esc(orderDetails.contactName)}</p>
+                <p><strong>Email:</strong> ${esc(orderDetails.email)}</p>
+                <p><strong>Phone:</strong> ${esc(orderDetails.phone)}</p>
+                <p><strong>Trade Type:</strong> ${esc(orderDetails.tradeType)}</p>
+                <p><strong>Service Area:</strong> ${esc(orderDetails.serviceArea)}</p>
+                <p><strong>Package:</strong> ${esc(orderDetails.packageType)} ($${esc(orderDetails.amount)})</p>
             </div>
             <p><strong>Action Required:</strong> Begin website development for this customer within 24 hours.</p>
         </div>
@@ -383,19 +273,10 @@ async function sendAdminNotification(orderDetails) {
 </body>
 </html>
     `;
-
-    await transporter.sendMail({
-        from: process.env.SMTP_FROM || 'info@azcontractorpro.com',
-        to: process.env.ADMIN_EMAIL || 'admin@arizonacontractorwebs.com',
-        subject: `New Order: ${orderDetails.businessName} - ${orderDetails.packageType}`,
-        html: emailHtml
-    });
 }
 
-// Payment success page
-app.get('/payment-success', (req, res) => {
-    const orderId = req.query.orderId;
-    res.send(`
+function successPageHtml({ orderId, businessName }) {
+    return `
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -435,10 +316,10 @@ app.get('/payment-success', (req, res) => {
         h1 { color: #4caf50; margin-bottom: 1rem; }
         h2 { color: #333; margin-bottom: 1rem; }
         p { color: #666; line-height: 1.6; margin-bottom: 1rem; }
-        .order-id { 
-            background: #f5f5f5; 
-            padding: 1rem; 
-            border-radius: 5px; 
+        .order-id {
+            background: #f5f5f5;
+            padding: 1rem;
+            border-radius: 5px;
             margin: 1.5rem 0;
             font-family: monospace;
         }
@@ -468,11 +349,9 @@ app.get('/payment-success', (req, res) => {
     <div class="success-container">
         <div class="checkmark">✓</div>
         <h1>Payment Successful!</h1>
-        <h2>Thank You for Your Order</h2>
+        <h2>Thank You${businessName ? `, ${esc(businessName)}` : ''}</h2>
         <p>Your payment has been processed successfully.</p>
-        <div class="order-id">
-            <strong>Order ID:</strong> ${orderId}
-        </div>
+        ${orderId ? `<div class="order-id"><strong>Order ID:</strong> ${esc(orderId)}</div>` : ''}
         <div class="next-steps">
             <h3>What Happens Next?</h3>
             <ol>
@@ -488,18 +367,202 @@ app.get('/payment-success', (req, res) => {
     </div>
 </body>
 </html>
-    `);
-});
+    `;
+}
 
-// Health check
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
+// ---------------------------------------------------------------- app
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log(`Environment: ${process.env.SQUARE_ENVIRONMENT || 'sandbox'}`);
-});
+/**
+ * deps (all injectable for tests):
+ *   stripe     Stripe client (checkout.sessions.create/retrieve, webhooks.constructEvent)
+ *   mailer     nodemailer-like { sendMail }, or null to skip emails
+ *   fetchImpl  used to report orders to the CRM
+ */
+function createApp({ config, stripe, mailer, fetchImpl = fetch, log = console }) {
+    const app = express();
+    app.disable('x-powered-by');
 
-module.exports = app;
+    // Fulfillment is idempotent within a process: Stripe retries webhooks and can deliver
+    // checkout.session.completed more than once. In-flight promises also stop concurrent duplicates.
+    const fulfilled = new Map();
+
+    async function reportToCrm(payload) {
+        if (!config.crmUrl || !config.crmKey) return;
+        try {
+            const res = await fetchImpl(`${config.crmUrl}/api/integrations/orders`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-builder-key': config.crmKey },
+                body: JSON.stringify(payload),
+                signal: AbortSignal.timeout(8000)
+            });
+            if (!res.ok) throw new Error(`CRM returned ${res.status}`);
+        } catch (err) {
+            log.error(`CRM order sync failed for ${payload.orderId}: ${err.message}`);
+        }
+    }
+
+    async function sendEmails(orderDetails) {
+        if (!mailer) {
+            log.warn(`SMTP is not configured; skipped emails for order ${orderDetails.orderId}`);
+            return;
+        }
+        await mailer.sendMail({
+            from: config.smtpFrom,
+            to: orderDetails.email,
+            subject: `Your ${orderDetails.businessName} Website Template - AZ Contractor Pro`,
+            html: customerEmailHtml(orderDetails)
+        });
+        log.log(`Bolt.new template sent to ${orderDetails.email}`);
+        await mailer.sendMail({
+            from: config.smtpFrom,
+            to: config.adminEmail,
+            subject: `New Order: ${orderDetails.businessName} - ${orderDetails.packageType}`,
+            html: adminEmailHtml(orderDetails)
+        });
+    }
+
+    function fulfill(session) {
+        if (!fulfilled.has(session.id)) {
+            const job = (async () => {
+                const orderDetails = orderFromSession(session);
+                await sendEmails(orderDetails);
+                await reportToCrm({
+                    ...orderDetails, status: 'paid',
+                    paymentId: session.payment_intent || null, checkoutSessionId: session.id
+                });
+            })();
+            fulfilled.set(session.id, job);
+            // A failed attempt is forgotten so Stripe's retry can run it again
+            job.catch(() => fulfilled.delete(session.id));
+        }
+        return fulfilled.get(session.id);
+    }
+
+    // Stripe webhook: needs the raw body for signature checks, so it is registered before express.json()
+    app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+        if (!config.stripeWebhookSecret) {
+            log.error('STRIPE_WEBHOOK_SECRET is not set; rejecting webhook');
+            return res.status(503).send('Webhook not configured');
+        }
+        let event;
+        try {
+            event = stripe.webhooks.constructEvent(req.body, req.get('stripe-signature'), config.stripeWebhookSecret);
+        } catch (err) {
+            log.warn(`Webhook signature verification failed: ${err.message}`);
+            return res.status(400).send(`Webhook Error: ${err.message}`);
+        }
+
+        const session = event.data.object;
+        try {
+            switch (event.type) {
+                case 'checkout.session.completed':
+                    // Cards are paid by now; delayed methods (e.g. ACH) arrive later as async_payment_succeeded
+                    if (session.payment_status === 'paid' || session.payment_status === 'no_payment_required') {
+                        await fulfill(session);
+                    } else {
+                        await reportToCrm({ ...orderFromSession(session), status: 'pending', checkoutSessionId: session.id });
+                    }
+                    break;
+                case 'checkout.session.async_payment_succeeded':
+                    await fulfill(session);
+                    break;
+                case 'checkout.session.async_payment_failed':
+                case 'checkout.session.expired':
+                    await reportToCrm({ ...orderFromSession(session), status: 'canceled', checkoutSessionId: session.id });
+                    break;
+                default:
+                    break;
+            }
+        } catch (err) {
+            log.error(`Webhook ${event.type} for ${session?.id} failed: ${err.message}`);
+            // 5xx makes Stripe retry the event later
+            return res.status(500).json({ error: 'Fulfillment failed; Stripe will retry' });
+        }
+        res.json({ received: true });
+    });
+
+    app.use(express.json({ limit: '20kb' }));
+
+    // Create Stripe Checkout Session for the order form
+    const corsOptions = { origin: config.allowedOrigins.length ? config.allowedOrigins : true };
+    app.options('/api/create-checkout-session', cors(corsOptions));
+    app.post('/api/create-checkout-session', cors(corsOptions), async (req, res) => {
+        const { order, error } = validateOrder(req.body);
+        if (error) return res.status(400).json({ success: false, error });
+
+        const pkg = PACKAGES[order.packageType];
+        const orderId = `ACP-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+        const metadata = { orderId, ...order };
+
+        try {
+            const session = await stripe.checkout.sessions.create({
+                mode: 'payment',
+                line_items: [{
+                    quantity: 1,
+                    price_data: { currency: 'usd', unit_amount: pkg.price * 100, product_data: { name: pkg.name } }
+                }],
+                customer_email: order.email,
+                client_reference_id: orderId,
+                metadata,
+                payment_intent_data: { metadata, description: `${pkg.name} - ${order.businessName}` },
+                success_url: `${config.baseUrl}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+                cancel_url: `${config.baseUrl}/?canceled=1#order`
+            }, { idempotencyKey: orderId });
+
+            reportToCrm({ ...metadata, amount: pkg.price, status: 'pending', checkoutSessionId: session.id });
+            res.json({ success: true, checkoutUrl: session.url, orderId });
+        } catch (err) {
+            log.error('Stripe checkout error:', err.message);
+            res.status(502).json({ success: false, error: 'Could not start checkout. Please try again or contact us.' });
+        }
+    });
+
+    // Payment success page (display only; fulfillment happens in the webhook)
+    app.get('/payment-success', async (req, res) => {
+        const sessionId = String(req.query.session_id || '');
+        let details = {};
+        if (/^cs_[A-Za-z0-9_]+$/.test(sessionId)) {
+            try {
+                const session = await stripe.checkout.sessions.retrieve(sessionId);
+                details = { orderId: session.metadata?.orderId, businessName: session.metadata?.businessName };
+            } catch (err) {
+                log.warn(`Could not load checkout session ${sessionId}: ${err.message}`);
+            }
+        }
+        res.send(successPageHtml(details));
+    });
+
+    // The marketing site and order form
+    app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'az-contractor-pro.html')));
+
+    // Health check
+    app.get('/health', (req, res) => {
+        res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    });
+
+    return app;
+}
+
+if (require.main === module) {
+    const config = configFromEnv();
+    if (!config.stripeSecretKey) {
+        console.error('STRIPE_SECRET_KEY is not set. Copy .env.example to .env and add your Stripe keys.');
+        process.exit(1);
+    }
+    const mailer = config.smtp.user
+        ? nodemailer.createTransport({
+            host: config.smtp.host,
+            port: config.smtp.port,
+            secure: config.smtp.port === 465,
+            auth: { user: config.smtp.user, pass: config.smtp.pass }
+        })
+        : null;
+    const app = createApp({ config, stripe: new Stripe(config.stripeSecretKey), mailer });
+    app.listen(config.port, () => {
+        console.log(`Server running on port ${config.port}`);
+        console.log(`Stripe mode: ${config.stripeSecretKey.startsWith('sk_live_') ? 'LIVE' : 'test'}`);
+        if (!config.crmUrl) console.log('CRM_URL not set: orders will not be reported to the CRM');
+    });
+}
+
+module.exports = { createApp, configFromEnv, validateOrder, orderFromSession, generateBoltTemplate, PACKAGES };

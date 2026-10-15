@@ -650,7 +650,7 @@
                 <div class="process-step">
                     <div class="step-number">2</div>
                     <h3>Complete Payment</h3>
-                    <p>Secure payment processing with Square</p>
+                    <p>Secure card payment through Stripe</p>
                 </div>
                 <div class="process-step">
                     <div class="step-number">3</div>
@@ -752,8 +752,9 @@
                         </div>
                     </div>
 
+                    <div id="orderMessage" role="alert" style="display: none; margin-bottom: 1rem; padding: 0.8rem 1rem; border-radius: 5px; background: #fff3e0; color: #8a3a00; text-align: left;"></div>
                     <button type="submit" class="submit-button" id="submitButton" disabled>
-                        Complete Payment with Square
+                        Continue to Secure Payment
                     </button>
                     <div class="spinner" id="loadingSpinner"></div>
                     <p style="margin-top: 1rem; font-size: 0.9rem; color: var(--gray);">
@@ -822,63 +823,64 @@
             });
         });
 
-        // Form submission - Square Payment Integration
+        // Form submission - Stripe Checkout
+        // Leave API_BASE empty when payment-server.js serves this page. If the page is hosted
+        // elsewhere, set it to the payment server's URL and list this site in ALLOWED_ORIGINS.
+        const API_BASE = '';
+        const orderMessage = document.getElementById('orderMessage');
+        const showOrderMessage = text => {
+            orderMessage.textContent = text;
+            orderMessage.style.display = text ? 'block' : 'none';
+        };
+
+        if (new URLSearchParams(location.search).has('canceled')) {
+            showOrderMessage('Checkout was canceled and you were not charged. Pick up where you left off whenever you\'re ready.');
+        }
+
         document.getElementById('orderForm').addEventListener('submit', async function(e) {
             e.preventDefault();
-            
+
             const formData = new FormData(this);
             const data = Object.fromEntries(formData);
-            
-            // Get selected package details
+
+            // Get selected package. The server sets the price from the package, never from the page.
             const selectedPackage = document.querySelector('input[name="package"]:checked');
             if (!selectedPackage) {
-                alert('Please select a package');
+                showOrderMessage('Please select a package.');
                 return;
             }
-            
             data.packageType = selectedPackage.value;
-            data.amount = selectedPackage.dataset.price;
-            
+            delete data.package;
+
             // Show loading state
+            showOrderMessage('');
             submitButton.disabled = true;
             submitButton.textContent = 'Processing...';
             document.getElementById('loadingSpinner').style.display = 'block';
-            
+
             try {
-                // TODO: Replace with your actual Square payment endpoint
-                // This is where you'll integrate with Square Checkout API
-                
-                // For now, this is a placeholder that shows the integration point
-                alert(`Order Details:\n\nBusiness: ${data.businessName}\nContact: ${data.contactName}\nEmail: ${data.email}\nPhone: ${data.phone}\nTrade: ${data.tradeType}\nArea: ${data.serviceArea}\nPackage: ${data.packageType}\nAmount: $${data.amount}\n\nNext Step: Integrate Square Checkout API\n\nAfter payment:\n1. Create Square checkout session\n2. Redirect to Square payment page\n3. Process payment\n4. Send confirmation email with bolt.new template\n5. Store order in database`);
-                
-                // Example Square Checkout API integration:
-                /*
-                const response = await fetch('/api/create-square-checkout', {
+                const response = await fetch(API_BASE + '/api/create-checkout-session', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(data)
                 });
-                
-                const result = await response.json();
-                
-                if (result.checkoutUrl) {
-                    // Redirect to Square checkout page
+                const result = await response.json().catch(() => ({}));
+
+                if (response.ok && result.checkoutUrl) {
+                    // Redirect to Stripe's secure checkout page
                     window.location.href = result.checkoutUrl;
-                } else {
-                    throw new Error('Failed to create checkout session');
+                    return;
                 }
-                */
-                
+                throw new Error(result.error || 'Failed to create checkout session');
             } catch (error) {
                 console.error('Error:', error);
-                alert('There was an error processing your order. Please try again or contact support.');
-            } finally {
-                submitButton.disabled = false;
-                submitButton.textContent = 'Complete Payment with Square';
-                document.getElementById('loadingSpinner').style.display = 'none';
+                showOrderMessage(error.message && !/fetch/i.test(error.message)
+                    ? error.message
+                    : 'There was an error starting your payment. Please try again or contact us.');
             }
+            submitButton.disabled = false;
+            submitButton.textContent = 'Continue to Secure Payment';
+            document.getElementById('loadingSpinner').style.display = 'none';
         });
 
         // Smooth scrolling for anchor links
